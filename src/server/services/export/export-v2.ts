@@ -108,34 +108,40 @@ async function findEntriesForHierarchy(
     return {};
   }
 
-  let entries = await findEntries(slug, deepness, { search, ids })
-    .then((entries: Entry[]) => {
-      entries = toArray(entries).filter(Boolean);
+  const UNWANTED_RELATIONS: SchemaUID[] = ['admin::user'];
+  const relationAttributes: RelationAttribute[] = getModelAttributes(slug, { filterType: ['relation'] }) as RelationAttribute[];
+  const mixedAttributes: Attribute[] = getModelAttributes(slug, { filterType: ['component', 'dynamiczone', 'media', 'relation'] }) as Attribute[];
 
-      // Export locales
-      if (schema.pluginOptions?.i18n?.localized) {
-        const allEntries = [...entries];
-        const entryIdsToExported = fromPairs(allEntries.map((entry) => [entry.id, true]));
+  for await (let pageEntries of iterateFindEntries(slug, deepness, { search, ids })) {
+    pageEntries = toArray(pageEntries).filter(Boolean);
 
-        for (const entry of entries) {
-          (entry.localizations || []).forEach((localization) => {
-            if (localization.id && !entryIdsToExported[localization.id]) {
-              allEntries.push(localization as any);
-              entryIdsToExported[localization.id] = true;
-            }
-          });
-        }
-
-        return allEntries;
+    // Export locales
+    if (schema.pluginOptions?.i18n?.localized) {
+      const allEntries = [...pageEntries];
+      const entryIdsToExported = fromPairs(allEntries.map((entry) => [entry.id, true]));
+      for (const entry of pageEntries) {
+        (entry.localizations || []).forEach((localization) => {
+          if (localization.id && !entryIdsToExported[localization.id]) {
+            allEntries.push(localization as any);
+            entryIdsToExported[localization.id] = true;
+          }
+        });
       }
+      pageEntries = allEntries;
+    }
 
-      return entries;
-    })
-    .then((entries) => toArray(entries));
+    // Remove unwanted relations to admin::user
+    pageEntries = pageEntries.map((entry) => {
+      relationAttributes.forEach((attribute) => {
+        if (UNWANTED_RELATIONS.includes(attribute.target)) {
+          deleteEntryProp(entry, attribute.name);
+        }
+      });
+      return entry;
+    });
 
-  // Transform relations as ids.
-  let entriesFlatten: Entry[] = cloneDeep(entries);
-  (() => {
+    // Flatten relations/components/media to ids for storing
+    let entriesFlatten: Entry[] = cloneDeep(pageEntries);
     const flattenEntryCommon = (entry: Exclude<Entry, DynamicZoneEntry> | Exclude<Entry, DynamicZoneEntry>[]) => {
       if (entry == null) {
         return null;
@@ -151,7 +157,6 @@ async function findEntriesForHierarchy(
       }
       return entry;
     };
-
     const flattenProperty = (propAttribute: Attribute, propEntries: Entry | Entry[]) => {
       if (propEntries == null) {
         return null;
@@ -169,124 +174,93 @@ async function findEntriesForHierarchy(
       }
       return propEntries;
     };
-
     const flattenEntry = (entry: Entry, slug: SchemaUID) => {
-      const attributes: Attribute[] = getModelAttributes(slug, { filterType: ['component', 'dynamiczone', 'media', 'relation'] }) as Attribute[];
-
+      const attributes: Attribute[] = mixedAttributes as Attribute[];
       for (const attribute of attributes) {
         setEntryProp(entry, attribute.name, flattenProperty(attribute, getEntryProp(entry, attribute.name)));
       }
-
       return entry;
     };
-
     entriesFlatten = entriesFlatten.map((entry) => flattenEntry(entry, slug));
-  })();
 
-  store = mergeObjects({ [slug]: Object.fromEntries(entriesFlatten.map((entry) => [entry.id, entry])) }, store);
+    // Merge current page into store
+    store = mergeObjects({ [slug]: Object.fromEntries(entriesFlatten.map((entry) => [entry.id, entry])) }, store);
 
-  // Skip admin::user slug.
-  const filterOutUnwantedRelations = () => {
-    const UNWANTED_RELATIONS: SchemaUID[] = ['admin::user'];
-    const attributes: RelationAttribute[] = getModelAttributes(slug, { filterType: ['relation'] }) as RelationAttribute[];
-
-    return entries.map((entry) => {
-      attributes.forEach((attribute) => {
-        if (UNWANTED_RELATIONS.includes(attribute.target)) {
-          deleteEntryProp(entry, attribute.name);
-        }
-      });
-      return entry;
-    });
-  };
-  filterOutUnwantedRelations();
-
-  const findAndFlattenComponentAttributes = async () => {
-    let attributes: ComponentAttribute[] = getModelAttributes(slug, { filterType: ['component'] }) as ComponentAttribute[];
-    for (const attribute of attributes) {
+    // For each page, collect ids and recurse immediately to limit memory growth
+    const componentAttributes: ComponentAttribute[] = getModelAttributes(slug, { filterType: ['component'] }) as ComponentAttribute[];
+    for (const attribute of componentAttributes) {
       const attributeSlug: SchemaUID | undefined = hierarchy[attribute.name]?.__slug;
       if (!attributeSlug) {
         continue;
       }
-
-      const ids: EntryId[] = entries
+      const ids: EntryId[] = pageEntries
         .filter((entry) => !!getEntryProp(entry, attribute.name))
         .flatMap((entry) => getEntryProp(entry, attribute.name) as ComponentEntry | ComponentEntry[])
         .filter((entry) => !!entry.id)
         .map((entry) => entry.id)
         .filter((id) => typeof store?.[attributeSlug]?.[`${id}`] === 'undefined');
-
-      const dataToStore = await findEntriesForHierarchy(store, attributeSlug, hierarchy[attribute.name], deepness - 1, { ids });
-      store = mergeObjects(dataToStore, store);
+      if (ids.length) {
+        const dataToStore = await findEntriesForHierarchy(store, attributeSlug, hierarchy[attribute.name], deepness - 1, { ids });
+        store = mergeObjects(dataToStore, store);
+      }
     }
-  };
-  await findAndFlattenComponentAttributes();
 
-  const findAndFlattenDynamicZoneAttributes = async () => {
-    let attributes: DynamicZoneAttribute[] = getModelAttributes(slug, { filterType: ['dynamiczone'] }) as DynamicZoneAttribute[];
-    for (const attribute of attributes) {
+    const dynamicZoneAttributes: DynamicZoneAttribute[] = getModelAttributes(slug, { filterType: ['dynamiczone'] }) as DynamicZoneAttribute[];
+    for (const attribute of dynamicZoneAttributes) {
       for (const slugFromAttribute of attribute.components) {
         const componentHierarchy = hierarchy[attribute.name]?.[slugFromAttribute];
         const componentSlug: SchemaUID | undefined = componentHierarchy?.__slug;
         if (!componentSlug) {
           continue;
         }
-
-        const ids = entries
+        const ids = pageEntries
           .filter((entry) => !!getEntryProp(entry, attribute.name))
           .flatMap((entry) => getEntryProp(entry, attribute.name))
           .filter((entry: DynamicZoneEntry) => entry?.__component === slugFromAttribute)
           .map((entry) => entry.id)
           .filter((id) => typeof store?.[componentSlug]?.[`${id}`] === 'undefined');
+        if (ids.length) {
+          const dataToStore = await findEntriesForHierarchy(store, componentSlug, componentHierarchy, deepness - 1, { ids });
+          store = mergeObjects(dataToStore, store);
+        }
+      }
+    }
 
-        const dataToStore = await findEntriesForHierarchy(store, componentSlug, componentHierarchy, deepness - 1, { ids });
+    const mediaAttributes: MediaAttribute[] = getModelAttributes(slug, { filterType: ['media'] }) as MediaAttribute[];
+    for (const attribute of mediaAttributes) {
+      const attributeSlug: SchemaUID | undefined = hierarchy[attribute.name]?.__slug;
+      if (!attributeSlug) {
+        continue;
+      }
+      const ids = pageEntries
+        .filter((entry) => !!getEntryProp(entry, attribute.name))
+        .flatMap((entry) => getEntryProp(entry, attribute.name))
+        .filter((entry) => !!entry.id)
+        .map((entry) => entry.id)
+        .filter((id) => typeof store?.[attributeSlug]?.[`${id}`] === 'undefined');
+      if (ids.length) {
+        const dataToStore = await findEntriesForHierarchy(store, attributeSlug, hierarchy[attribute.name], deepness - 1, { ids });
         store = mergeObjects(dataToStore, store);
       }
     }
-  };
-  await findAndFlattenDynamicZoneAttributes();
 
-  const findAndFlattenMediaAttributes = async () => {
-    let attributes: MediaAttribute[] = getModelAttributes(slug, { filterType: ['media'] }) as MediaAttribute[];
-    for (const attribute of attributes) {
+    for (const attribute of relationAttributes) {
       const attributeSlug: SchemaUID | undefined = hierarchy[attribute.name]?.__slug;
       if (!attributeSlug) {
         continue;
       }
-
-      const ids = entries
+      const ids = pageEntries
         .filter((entry) => !!getEntryProp(entry, attribute.name))
         .flatMap((entry) => getEntryProp(entry, attribute.name))
         .filter((entry) => !!entry.id)
         .map((entry) => entry.id)
         .filter((id) => typeof store?.[attributeSlug]?.[`${id}`] === 'undefined');
-
-      const dataToStore = await findEntriesForHierarchy(store, attributeSlug, hierarchy[attribute.name], deepness - 1, { ids });
-      store = mergeObjects(dataToStore, store);
-    }
-  };
-  await findAndFlattenMediaAttributes();
-
-  const findAndFlattenRelationAttributes = async () => {
-    let attributes: RelationAttribute[] = getModelAttributes(slug, { filterType: ['relation'] }) as RelationAttribute[];
-    for (const attribute of attributes) {
-      const attributeSlug: SchemaUID | undefined = hierarchy[attribute.name]?.__slug;
-      if (!attributeSlug) {
-        continue;
+      if (ids.length) {
+        const dataToStore = await findEntriesForHierarchy(store, attributeSlug, hierarchy[attribute.name], deepness - 1, { ids });
+        store = mergeObjects(dataToStore, store);
       }
-
-      const ids = entries
-        .filter((entry) => !!getEntryProp(entry, attribute.name))
-        .flatMap((entry) => getEntryProp(entry, attribute.name))
-        .filter((entry) => !!entry.id)
-        .map((entry) => entry.id)
-        .filter((id) => typeof store?.[attributeSlug]?.[`${id}`] === 'undefined');
-
-      const dataToStore = await findEntriesForHierarchy(store, attributeSlug, hierarchy[attribute.name], deepness - 1, { ids });
-      store = mergeObjects(dataToStore, store);
     }
-  };
-  await findAndFlattenRelationAttributes();
+  }
 
   return store;
 }
@@ -310,6 +284,42 @@ async function findEntries(slug: string, deepness: number, { search, ids }: { se
     return entries;
   } catch (_) {
     return [];
+  }
+}
+
+async function* iterateFindEntries(slug: string, deepness: number, { search, ids, pageSize = 500 }: { search?: string; ids?: EntryId[]; pageSize?: number }) {
+  if (ids && ids.length > 0) {
+    for (let start = 0; start < ids.length; start += pageSize) {
+      const chunk = ids.slice(start, start + pageSize);
+      const data = await findEntries(slug, deepness, { ids: chunk });
+      yield data;
+    }
+    return;
+  }
+
+  let page = 1;
+  while (true) {
+    try {
+      const queryBuilder = new ObjectBuilder();
+      queryBuilder.extend(getPopulateFromSchema(slug, deepness));
+      if (search) {
+        queryBuilder.extend(buildFilterQuery(search));
+      }
+      queryBuilder.extend({ pagination: { page, pageSize } });
+
+      const pageEntries: Entry[] = await strapi.entityService.findMany(slug, queryBuilder.get());
+      const safeEntries = toArray(pageEntries);
+      if (!safeEntries.length) {
+        break;
+      }
+      yield safeEntries;
+      if (safeEntries.length < pageSize) {
+        break;
+      }
+      page += 1;
+    } catch (_) {
+      break;
+    }
   }
 }
 

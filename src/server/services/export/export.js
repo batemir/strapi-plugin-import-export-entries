@@ -41,7 +41,19 @@ const exportData = async ({ slug, search, applySearch, exportFormat, relationsAs
   }
   const query = queryBuilder.get();
 
-  const entries = await strapi.entityService.findMany(slugToProcess, query);
+  const PAGE_SIZE = 500;
+  const entries = [];
+  for (let page = 1; ; page += 1) {
+    const pageQuery = merge(query, { pagination: { page, pageSize: PAGE_SIZE } });
+    const pageEntries = await strapi.entityService.findMany(slugToProcess, pageQuery);
+    if (!pageEntries || pageEntries.length === 0) {
+      break;
+    }
+    entries.push(...pageEntries);
+    if (pageEntries.length < PAGE_SIZE) {
+      break;
+    }
+  }
 
   const data = convertData(entries, {
     slug: slugToProcess,
