@@ -112,8 +112,9 @@ async function findEntriesForHierarchy(
   const relationAttributes: RelationAttribute[] = getModelAttributes(slug, { filterType: ['relation'] }) as RelationAttribute[];
   const mixedAttributes: Attribute[] = getModelAttributes(slug, { filterType: ['component', 'dynamiczone', 'media', 'relation'] }) as Attribute[];
 
-  for await (let pageEntries of iterateFindEntries(slug, deepness, { search, ids })) {
-    pageEntries = toArray(pageEntries).filter(Boolean);
+  const PAGE_SIZE = 500;
+  const processPage = async (pageEntriesRaw: Entry[]) => {
+    let pageEntries = toArray(pageEntriesRaw).filter(Boolean);
 
     // Export locales
     if (schema.pluginOptions?.i18n?.localized) {
@@ -260,6 +261,39 @@ async function findEntriesForHierarchy(
         store = mergeObjects(dataToStore, store);
       }
     }
+  };
+
+  if (ids && ids.length > 0) {
+    for (let start = 0; start < ids.length; start += PAGE_SIZE) {
+      const chunk = ids.slice(start, start + PAGE_SIZE);
+      const data = await findEntries(slug, deepness, { ids: chunk });
+      await processPage(data);
+    }
+  } else {
+    let page = 1;
+    while (true) {
+      try {
+        const queryBuilder = new ObjectBuilder();
+        queryBuilder.extend(getPopulateFromSchema(slug, deepness));
+        if (search) {
+          queryBuilder.extend(buildFilterQuery(search));
+        }
+        queryBuilder.extend({ pagination: { page, pageSize: PAGE_SIZE } });
+
+        const pageEntries: Entry[] = await strapi.entityService.findMany(slug, queryBuilder.get());
+        const safeEntries = toArray(pageEntries);
+        if (!safeEntries.length) {
+          break;
+        }
+        await processPage(safeEntries);
+        if (safeEntries.length < PAGE_SIZE) {
+          break;
+        }
+        page += 1;
+      } catch (_) {
+        break;
+      }
+    }
   }
 
   return store;
@@ -287,41 +321,7 @@ async function findEntries(slug: string, deepness: number, { search, ids }: { se
   }
 }
 
-async function* iterateFindEntries(slug: string, deepness: number, { search, ids, pageSize = 500 }: { search?: string; ids?: EntryId[]; pageSize?: number }) {
-  if (ids && ids.length > 0) {
-    for (let start = 0; start < ids.length; start += pageSize) {
-      const chunk = ids.slice(start, start + pageSize);
-      const data = await findEntries(slug, deepness, { ids: chunk });
-      yield data;
-    }
-    return;
-  }
-
-  let page = 1;
-  while (true) {
-    try {
-      const queryBuilder = new ObjectBuilder();
-      queryBuilder.extend(getPopulateFromSchema(slug, deepness));
-      if (search) {
-        queryBuilder.extend(buildFilterQuery(search));
-      }
-      queryBuilder.extend({ pagination: { page, pageSize } });
-
-      const pageEntries: Entry[] = await strapi.entityService.findMany(slug, queryBuilder.get());
-      const safeEntries = toArray(pageEntries);
-      if (!safeEntries.length) {
-        break;
-      }
-      yield safeEntries;
-      if (safeEntries.length < pageSize) {
-        break;
-      }
-      page += 1;
-    } catch (_) {
-      break;
-    }
-  }
-}
+// removed async generator to avoid requiring ES2018 async iterables in TS config
 
 function buildFilterQuery(search = '') {
   let { filters, sort: sortRaw } = qs.parse(search);
